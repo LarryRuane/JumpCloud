@@ -9,9 +9,9 @@ import (
 )
 
 func main() {
-    // normally you would only call this from a test-main
-    hash.Test()
+	// normally you would only call this from a test-main
+	hash.Test()
 
-    // this never returns
-    hash.HttpHashEncode()
+	// this never returns
+	hash.HttpHashEncode()
 }
