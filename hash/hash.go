@@ -10,7 +10,9 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,27 +22,57 @@ func HashEncode(pw string) string {
 	return base64.StdEncoding.EncodeToString(h[:])
 }
 
-func HttpHashEncode() {
-	http.HandleFunc("/", handler) // each request calls handler
-	log.Fatal(http.ListenAndServe("localhost:8080", nil))
-}
+// Start an HTTP server ait for an HTTP request to hash a password (reply with the base64
+// encoding of the password)
+func HttpHashEncode(port int, id bool) {
+	var (
+		shutdownPending bool
+		running         sync.WaitGroup
+	)
 
-// We have a request to process, write the hash of the password
-func handler(w http.ResponseWriter, r *http.Request) {
-	// simulate this request taking some time to process...
-	time.Sleep(5 * time.Second)
+	// keep wait group count artificially incremented until a shutdown
+    // request is received
+	running.Add(1)
 
-	switch r.URL.Path {
-	case "/hash":
-		body, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			break
+	// shutdown monitor
+	go func() {
+		running.Wait()
+		// all requests have been processed, and a shutdown has been requested
+		os.Exit(0)
+	}()
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if shutdownPending {
+			return
 		}
-		pw, success := extractPassword(string(body))
-		if success {
-			fmt.Fprintf(w, HashEncode(pw))
+
+		switch r.URL.Path {
+		case "/hash":
+			running.Add(1)
+
+			// simulate this request taking some time to process...
+			time.Sleep(5 * time.Second)
+
+			// read the body from this hash request and process it
+			body, err := ioutil.ReadAll(r.Body)
+			if err != nil {
+				break
+			}
+			pw, success := extractPassword(string(body))
+			if success {
+				fmt.Fprintf(w, HashEncode(pw))
+			}
+			running.Done()
+
+		case "/shutdown":
+			shutdownPending = true
+			// additional Done to allow the shutdown monitor to call Exit()
+			running.Done()
 		}
-	}
+	})
+
+    url := fmt.Sprintf("localhost:%d", port)
+	log.Fatal(http.ListenAndServe(url, nil))
 }
 
 // Look for a password in the given body; if found, return it and true
@@ -53,7 +85,7 @@ func extractPassword(body string) (string, bool) {
 	body = "&" + body + "&"
 
 	// the string we're looking for
-	key := "&password="
+	const key = "&password="
 
 	start := strings.Index(body, key)
 	if start == -1 {
