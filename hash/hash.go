@@ -5,6 +5,7 @@ package hash
 import (
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -16,13 +17,20 @@ import (
 	"time"
 )
 
-// Start an HTTP server, wait for an HTTP request to hash a password (reply with id)
-// or, given an id, reply with the hash of a previously hashed and encoded password
+// Start an HTTP server, wait for an HTTP request to hash a password
+// (reply with id), or, given an id, reply with the hash of a previously
+// hashed and encoded password
 func HttpHashEncode(port int) {
 	var (
 		shutdownPending bool
 		running         sync.WaitGroup
 		mu              sync.RWMutex
+	)
+
+	// stats (protected by mu)
+	var (
+		totalRequests int64
+		totalTime     time.Duration
 	)
 
 	// translates a saved password to its id (protected by mu)
@@ -51,8 +59,9 @@ func HttpHashEncode(port int) {
 
 		switch {
 		case strings.Index(r.URL.Path, "/hash/") == 0:
-			// look up the previously hashed password given by id
-			h := "" // if not found, return empty string
+			// look up the previously hashed password given by id;
+			// if not found or still calculating, return empty string
+			h := ""
 			id, err := strconv.Atoi(r.URL.Path[len("/hash/"):])
 			if err == nil && id > 0 {
 				mu.RLock()
@@ -67,6 +76,15 @@ func HttpHashEncode(port int) {
 		case r.URL.Path == "/hash":
 			// return the id of the hash of this password,
 			// computing it if necessary
+
+			// stats
+			defer func(start time.Time) {
+				mu.Lock()
+				totalTime += time.Since(start)
+				totalRequests++
+				mu.Unlock()
+			}(time.Now())
+
 			body, err := ioutil.ReadAll(r.Body)
 			if err != nil {
 				break
@@ -75,44 +93,71 @@ func HttpHashEncode(port int) {
 			if !success {
 				break
 			}
-			// return the id if it has already been seen and hashed
-			{
-				mu.RLock()
-				id := passwordToId[pw]
-				mu.RUnlock()
-				if id > 0 {
-					fmt.Fprintf(w, "%d", id)
-					break
-				}
+			mu.Lock()
+			id := passwordToId[pw]
+			if id == 0 {
+				// we haven't seen this password yet; assign a new id
+				// (starting at 1) for it, associate it from this password
+				id = len(idToHash) + 1
+				idToHash = append(idToHash, "")
+				passwordToId[pw] = id
+
+				// do time-consuming hashing and encoding in the background
+				go func(id int) {
+					// this work also counts toward stats total hash time
+					defer func(start time.Time) {
+						mu.Lock()
+						totalTime += time.Since(start)
+						totalRequests++
+						mu.Unlock()
+					}(time.Now())
+
+					// keep shutdown from completing until we're done
+					running.Add(1)
+					defer running.Done()
+
+					// simulate this taking a long time
+					time.Sleep(5 * time.Second)
+					h := sha512.Sum512([]byte(pw))
+					he := base64.StdEncoding.EncodeToString(h[:])
+
+					// remember the result (for future lookup requests)
+					mu.Lock()
+					idToHash[id-1] = he
+					mu.Unlock()
+				}(id)
 			}
-			// assign a new id (starting at 1), associate it with this password
-			mu.Lock()
-			id := len(idToHash) + 1
-			idToHash = append(idToHash, "")
-			passwordToId[pw] = id
 			mu.Unlock()
-
-			// simulate time-consuming hashing and encoding
-			running.Add(1)
-			time.Sleep(5 * time.Second)
-			h := sha512.Sum512([]byte(pw))
-			he := base64.StdEncoding.EncodeToString(h[:])
-
-			// remember the result (for future lookup requests)
-			mu.Lock()
-			idToHash[id-1] = he
-			mu.Unlock()
-
 			fmt.Fprintf(w, "%d", id)
-			running.Done()
 
 		case r.URL.Path == "/shutdown":
+			mu.Lock()
+			if !shutdownPending {
+				// remove the extra Add so the shutdown monitor can call Exit()
+				running.Done()
+			}
 			shutdownPending = true
-			// remove the extra Add to allow the shutdown monitor to call Exit()
-			running.Done()
+			mu.Unlock()
+		case r.URL.Path == "/stats":
+			type stats struct {
+				Total   int64         `json:"total"`
+				Average time.Duration `json:"average"`
+			}
+			// avoid division by zero
+			tr := totalRequests
+			if tr == 0 {
+				tr = 1
+			}
+			currentStats := stats{
+				Total:   totalRequests,
+				Average: totalTime / time.Millisecond / time.Duration(tr),
+			}
+			st, err := json.Marshal(currentStats)
+			if err == nil {
+				fmt.Fprintf(w, "%s", st)
+			}
 		}
 	})
-
 	url := fmt.Sprintf("localhost:%d", port)
 	log.Fatal(http.ListenAndServe(url, nil))
 }
