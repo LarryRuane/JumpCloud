@@ -1,7 +1,6 @@
 package hash
 
 // JumpCloud assignment: password hashing and encoding
-// (this is for steps 1-2, more to do)
 
 import (
 	"crypto/sha512"
@@ -11,33 +10,37 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// Return the Base64 encoding of the hash of the given password.
-func HashEncode(pw string) string {
-	h := sha512.Sum512([]byte(pw))
-	return base64.StdEncoding.EncodeToString(h[:])
-}
-
-// Start an HTTP server ait for an HTTP request to hash a password (reply with the base64
-// encoding of the password)
-func HttpHashEncode(port int, id bool) {
+// Start an HTTP server, wait for an HTTP request to hash a password (reply with id)
+// or, given an id, reply with the hash of a previously hashed and encoded password
+func HttpHashEncode(port int) {
 	var (
 		shutdownPending bool
 		running         sync.WaitGroup
+		mu              sync.RWMutex
 	)
 
+	// translates a saved password to its id (protected by mu)
+	passwordToId := make(map[string]int)
+
+	// translates an id to a previously-calculated hashed-encoded password;
+	// ids start at 1, so that id maps to idToHash[0]
+	// (protected by mu)
+	idToHash := make([]string, 0)
+
 	// keep wait group count artificially incremented until a shutdown
-    // request is received
+	// request is received
 	running.Add(1)
 
 	// shutdown monitor
 	go func() {
 		running.Wait()
-		// all requests have been processed, and a shutdown has been requested
+		// a shutdown request has been received, and no requests are active
 		os.Exit(0)
 	}()
 
@@ -46,32 +49,71 @@ func HttpHashEncode(port int, id bool) {
 			return
 		}
 
-		switch r.URL.Path {
-		case "/hash":
-			running.Add(1)
+		switch {
+		case strings.Index(r.URL.Path, "/hash/") == 0:
+			// look up the previously hashed password given by id
+			h := "" // if not found, return empty string
+			id, err := strconv.Atoi(r.URL.Path[len("/hash/"):])
+			if err == nil && id > 0 {
+				mu.RLock()
+				if id <= len(idToHash) {
+					h = idToHash[id-1]
+				}
+				mu.RUnlock()
+			}
+			fmt.Fprintf(w, "%s", h)
+			break
 
-			// simulate this request taking some time to process...
-			time.Sleep(5 * time.Second)
-
-			// read the body from this hash request and process it
+		case r.URL.Path == "/hash":
+			// return the id of the hash of this password,
+			// computing it if necessary
 			body, err := ioutil.ReadAll(r.Body)
 			if err != nil {
 				break
 			}
 			pw, success := extractPassword(string(body))
-			if success {
-				fmt.Fprintf(w, HashEncode(pw))
+			if !success {
+				break
 			}
+			// return the id if it has already been seen and hashed
+			{
+				mu.RLock()
+				id := passwordToId[pw]
+				mu.RUnlock()
+				if id > 0 {
+					fmt.Fprintf(w, "%d", id)
+					break
+				}
+			}
+			// assign a new id (starting at 1), associate it with this password
+			mu.Lock()
+			id := len(idToHash) + 1
+			idToHash = append(idToHash, "")
+			passwordToId[pw] = id
+			mu.Unlock()
+
+			// simulate time-consuming hashing and encoding
+			running.Add(1)
+			time.Sleep(5 * time.Second)
+			h := sha512.Sum512([]byte(pw))
+			he := base64.StdEncoding.EncodeToString(h[:])
+
+			// remember the result (for future lookup requests)
+			mu.Lock()
+			idToHash[id-1] = he
+			mu.Unlock()
+
+			fmt.Fprintf(w, "%d", id)
 			running.Done()
 
-		case "/shutdown":
+		case r.URL.Path == "/shutdown":
 			shutdownPending = true
-			// additional Done to allow the shutdown monitor to call Exit()
+			// remove the extra Add to allow the shutdown monitor to call Exit()
 			running.Done()
 		}
 	})
 
-    url := fmt.Sprintf("localhost:%d", port)
+	url := fmt.Sprintf("localhost:%d", port)
 	log.Fatal(http.ListenAndServe(url, nil))
 }
 
@@ -101,34 +143,4 @@ func extractPassword(body string) (string, bool) {
 	}
 	// just the password itself (there may be other stuff following)
 	return pw[:end], true
-}
-
-// **** test code ****
-// Extracting the password is a bit complex, so let's have some tests!
-func testExtractPassword(body string, expectedPw string, expectedSuccess bool) {
-	pw, success := extractPassword(body)
-	if success != expectedSuccess {
-		log.Fatalf("unit test failure: input: %s, expectedSuccess: %t, result: %t",
-			body, expectedSuccess, success)
-	}
-	if success && pw != expectedPw {
-		log.Fatalf("unit test failure: input: %s, expected: %s, result: %s",
-			body, expectedPw, pw)
-	}
-}
-
-func Test() {
-	// arguments are:
-	// html body, expected extracted password, whether the password was found
-	testExtractPassword("password=mypw", "mypw", true)
-	testExtractPassword("passwor=mypw", "dontcare", false)
-	testExtractPassword("Password=mypw", "mypw", false)
-	testExtractPassword("password=mypw&", "mypw", true)
-	testExtractPassword("&password=mypw", "mypw", true)
-	testExtractPassword("foo=bar&password=mypw", "mypw", true)
-	testExtractPassword("password=mypw&foo=bar", "mypw", true)
-	testExtractPassword("foo=bar&password=mypw&another=xx", "mypw", true)
-	testExtractPassword("passwordX=not&password=mypw&foo=bar", "mypw", true)
-	testExtractPassword("password =not&password=mypw&foo=bar", "mypw", true)
-	testExtractPassword("password=mypw&password=bar", "mypw", true) // first found
 }
