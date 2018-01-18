@@ -24,13 +24,7 @@ func HttpHashEncode(port int) {
 	var (
 		shutdownPending bool
 		running         sync.WaitGroup
-		mu              sync.RWMutex
-	)
-
-	// stats (protected by mu)
-	var (
-		totalRequests int64
-		totalTime     time.Duration
+		mu              sync.Mutex
 	)
 
 	// translates a saved password to its id (protected by mu)
@@ -40,6 +34,17 @@ func HttpHashEncode(port int) {
 	// ids start at 1, so that id maps to idToHash[0]
 	// (protected by mu)
 	idToHash := make([]string, 0)
+
+	// threads wait on this condition variable when the the hash they
+	// need is being generated; each time a new hash is available,
+	// all waiters are awakened
+	newHash := sync.NewCond(&mu)
+
+	// stats (protected by mu)
+	var (
+		totalRequests int64
+		totalTime     time.Duration
+	)
 
 	// keep wait group count artificially incremented until a shutdown
 	// request is received
@@ -64,11 +69,15 @@ func HttpHashEncode(port int) {
 			h := ""
 			id, err := strconv.Atoi(r.URL.Path[len("/hash/"):])
 			if err == nil && id > 0 {
-				mu.RLock()
+				mu.Lock()
 				if id <= len(idToHash) {
+					for idToHash[id-1] == "" {
+						// hash still being computed
+						newHash.Wait()
+					}
 					h = idToHash[id-1]
 				}
-				mu.RUnlock()
+				mu.Unlock()
 			}
 			fmt.Fprintf(w, "%s", h)
 			break
@@ -108,7 +117,6 @@ func HttpHashEncode(port int) {
 					defer func(start time.Time) {
 						mu.Lock()
 						totalTime += time.Since(start)
-						totalRequests++
 						mu.Unlock()
 					}(time.Now())
 
@@ -125,6 +133,8 @@ func HttpHashEncode(port int) {
 					mu.Lock()
 					idToHash[id-1] = he
 					mu.Unlock()
+					// wake up any goroutines waiting for a hash
+					newHash.Broadcast()
 				}(id)
 			}
 			mu.Unlock()
