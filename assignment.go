@@ -5,13 +5,16 @@ package main
 import (
 	"flag"
 	"github.com/LarryRuane/JumpCloud/hash"
+	"log"
 )
 
 func main() {
-	// normally you would only call this from a test-main
 	port := flag.Int("port", 8080, "a nonzero integer")
 	flag.Parse()
 
-	// this never returns
-	hash.HttpHashEncode(*port)
+	//go hash.HttpHashEncode(*port+1)
+	err := hash.HttpHashEncode(*port)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
