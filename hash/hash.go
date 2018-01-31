@@ -28,6 +28,9 @@ type hashServer struct {
 	newHash      *sync.Cond
 	shutdownDone chan struct{}
 
+	w http.ResponseWriter
+	r *http.Request
+
 	// stats (protected by mutex mu)
 	totalRequests int64
 	totalTime     time.Duration
@@ -56,7 +59,9 @@ func HttpHashEncode(port int) error {
 
 	// start the server goroutine
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleRequest(&hs, w, r)
+		hs.r = r
+		hs.w = w
+		hs.handleRequest()
 	})
 
 	var err error
@@ -72,21 +77,21 @@ func HttpHashEncode(port int) error {
 }
 
 // Respond to various URL formats
-func handleRequest(hs *hashServer, w http.ResponseWriter, r *http.Request) {
+func (hs *hashServer) handleRequest() {
 	switch {
-	case strings.Index(r.URL.Path, "/hash/") == 0:
-		lookupHash(hs, w, r)
-	case r.URL.Path == "/hash":
-		generateHash(hs, w, r)
-	case r.URL.Path == "/stats":
-		reportStats(hs, w, r)
-	case r.URL.Path == "/shutdown":
-		shutdown(hs)
+	case strings.Index(hs.r.URL.Path, "/hash/") == 0:
+		hs.lookupHash()
+	case hs.r.URL.Path == "/hash":
+		hs.generateHash()
+	case hs.r.URL.Path == "/stats":
+		hs.reportStats()
+	case hs.r.URL.Path == "/shutdown":
+		hs.shutdown()
 	}
 }
 
 // Return the id of the hash of this password, computing it if necessary
-func generateHash(hs *hashServer, w http.ResponseWriter, r *http.Request) {
+func (hs *hashServer) generateHash() {
 	// stats
 	defer func(start time.Time) {
 		hs.mu.Lock()
@@ -95,7 +100,7 @@ func generateHash(hs *hashServer, w http.ResponseWriter, r *http.Request) {
 		hs.mu.Unlock()
 	}(time.Now())
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := ioutil.ReadAll(hs.r.Body)
 	if err != nil {
 		fmt.Println("malformed body", err)
 		return
@@ -113,13 +118,13 @@ func generateHash(hs *hashServer, w http.ResponseWriter, r *http.Request) {
 		id = len(hs.idToHash) + 1
 		hs.idToHash = append(hs.idToHash, "")
 		hs.passwordToId[pw] = id
-		go startComputeHash(hs, id, pw)
+		go hs.startComputeHash(id, pw)
 	}
 	hs.mu.Unlock()
-	fmt.Fprintf(w, "%d", id)
+	fmt.Fprintf(hs.w, "%d", id)
 }
 
-func startComputeHash(hs *hashServer, id int, pw string) {
+func (hs *hashServer) startComputeHash(id int, pw string) {
 	// this work also counts toward stats total hash time
 	defer func(start time.Time) {
 		hs.mu.Lock()
@@ -141,10 +146,10 @@ func startComputeHash(hs *hashServer, id int, pw string) {
 	hs.newHash.Broadcast()
 }
 
-func lookupHash(hs *hashServer, w http.ResponseWriter, r *http.Request) {
+func (hs *hashServer) lookupHash() {
 	// look up the previously hashed password given by id;
 	// if not found or still calculating, return empty string
-	id, err := strconv.Atoi(r.URL.Path[len("/hash/"):])
+	id, err := strconv.Atoi(hs.r.URL.Path[len("/hash/"):])
 	if err != nil {
 		fmt.Println("id format error:", err)
 		return
@@ -166,10 +171,10 @@ func lookupHash(hs *hashServer, w http.ResponseWriter, r *http.Request) {
 	}
 	h := hs.idToHash[id-1]
 	hs.mu.Unlock()
-	fmt.Fprintf(w, "%s", h)
+	fmt.Fprintf(hs.w, "%s", h)
 }
 
-func reportStats(hs *hashServer, w http.ResponseWriter, r *http.Request) {
+func (hs *hashServer) reportStats() {
 	type stats struct {
 		Total   int64         `json:"total"`
 		Average time.Duration `json:"average"`
@@ -187,11 +192,11 @@ func reportStats(hs *hashServer, w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Fprintf(w, "%s", st)
+	fmt.Fprintf(hs.w, "%s", st)
 }
 
 // Graceful shutdown
-func shutdown(hs *hashServer) {
+func (hs *hashServer) shutdown() {
 	// It should take less than 10 seconds for pending hash requests to complete
 	go func() {
 		ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
